@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from . import settings as S
-from .fb_client import FacebookClient, FBError, Friend, NotLoggedIn, load_selectors
+from .fb_client import (FacebookClient, FBError, Friend, NotLoggedIn, PokeEntry, PokeLimit,
+                        load_selectors, normalize_profile_url)
 
 log = logging.getLogger("birthday_bot")
 
@@ -24,6 +25,43 @@ class RunResult:
     failed: int = 0
     message: str = ""
     friends: list = field(default_factory=list)
+
+
+@dataclass
+class PokeResult:
+    ok: bool
+    busy: bool = False
+    waiting: int = 0
+    poked: int = 0
+    ignored: int = 0
+    left: int = 0
+    unknown: int = 0
+    failed: int = 0
+    message: str = ""
+
+
+def poke_rule_key(text: str) -> str:
+    """Rules are stored by profile URL when one is given, otherwise by lowercase name."""
+    text = (text or "").strip()
+    return normalize_profile_url(text) or text.lower()
+
+
+def poke_decision(cfg: dict, entry: PokeEntry) -> str:
+    """'poke', 'ignore' (never poke) or 'leave' (not picked in selected-only mode)."""
+    rules = cfg.get("poke_rules") or {}
+    if entry.friend is None:
+        return "unknown"
+    rule = rules.get(entry.friend.url) or rules.get(entry.friend.name.lower())
+    if rule is None:
+        # Extra safety: a name-based ignore also matches anywhere in the card text.
+        card = (entry.text or "").lower()
+        if any(v == "ignore" and not k.startswith("http") and k and k in card for k, v in rules.items()):
+            rule = "ignore"
+    if rule == "ignore":
+        return "ignore"
+    if rule == "auto":
+        return "poke"
+    return "poke" if cfg.get("poke_mode", "everyone") == "everyone" else "leave"
 
 
 def render_message(template: str, friend: Friend) -> str:
@@ -136,6 +174,97 @@ class BirthdayRunner:
             return None
         finally:
             self._lock.release()
+
+    # --- pokes -------------------------------------------------------------
+    def poke(self, scan_only: bool = False, reason: str = "manual") -> PokeResult:
+        if not self._lock.acquire(blocking=False):
+            return PokeResult(ok=False, busy=True, message="Busy with another task")
+        self.stop_event.clear()
+        try:
+            res = self._poke(scan_only, reason)
+        except NotLoggedIn as e:
+            res = PokeResult(ok=False, message=str(e))
+            self.on_event("login", False)
+        except FBError as e:
+            res = PokeResult(ok=False, message=str(e))
+        except Exception as e:
+            log.exception("Unexpected error during poke check")
+            res = PokeResult(ok=False, message=f"Unexpected error: {e}")
+        finally:
+            self._lock.release()
+        if not res.ok:
+            log.error("Poke check failed: %s", res.message)
+        self.state.set_last_poke(res.message)
+        self.on_event("poke_done", res)
+        return res
+
+    def _poke(self, scan_only: bool, reason: str) -> PokeResult:
+        cfg = self.settings.snapshot()
+        res = PokeResult(ok=True)
+        with self._client(headless=cfg.get("poke_headless", True)) as fb:
+            if not fb.is_logged_in():
+                raise NotLoggedIn("Not logged in. Click “Log in to Facebook” on the Dashboard.")
+            entries = fb.pokes()
+            res.waiting = len(entries)
+            for e in entries:
+                if e.friend:
+                    self.state.upsert_poker(e.friend.key, e.friend.name, e.friend.url, e.text)
+            verbose = scan_only or reason == "manual"
+            if verbose or entries:
+                who = ", ".join(e.friend.name if e.friend else "(unknown)" for e in entries)
+                log.info("Pokes waiting for you (%s): %s", reason, who or "none")
+
+            attempted: set[str] = set()
+            for e in entries:
+                d = poke_decision(cfg, e)
+                if d == "ignore":
+                    res.ignored += 1
+                elif d == "leave":
+                    res.left += 1
+                elif d == "unknown":
+                    res.unknown += 1
+                    log.warning("  Couldn't tell who one poke is from – leaving it alone to be safe.")
+            if scan_only:
+                res.message = self._poke_summary(res, scan_only=True)
+                return res
+
+            limit = int(cfg.get("poke_max_per_check", 20))
+            while res.poked + res.failed < limit and not self.stop_event.is_set():
+                todo = [e for e in entries if poke_decision(cfg, e) == "poke" and e.friend.key not in attempted]
+                if not todo:
+                    break
+                e = todo[0]
+                attempted.add(e.friend.key)
+                try:
+                    fb.poke_back(e)
+                    log.info("  👉 Poked %s back.", e.friend.name)
+                    self.state.record_poke_back(e.friend.key)
+                    res.poked += 1
+                except PokeLimit as ex:
+                    log.warning("  %s", ex)
+                    res.failed += 1
+                    break
+                except Exception as ex:
+                    log.error("  Couldn't poke %s back: %s", e.friend.name, ex)
+                    res.failed += 1
+                self.stop_event.wait(random.uniform(2, 6))
+                entries = fb.pokes()  # the page re-renders after each poke
+        res.ok = res.failed == 0
+        res.message = self._poke_summary(res)
+        if res.poked or res.failed or reason == "manual":
+            log.info("Pokes: %s.", res.message)
+        return res
+
+    @staticmethod
+    def _poke_summary(res: PokeResult, scan_only: bool = False) -> str:
+        parts = [f"{res.waiting} waiting"]
+        if not scan_only:
+            parts.append(f"{res.poked} poked back")
+        for n, label in ((res.ignored, "ignored"), (res.left, "not picked"), (res.unknown, "unidentified"),
+                         (res.failed, "failed")):
+            if n:
+                parts.append(f"{n} {label}")
+        return ", ".join(parts)
 
     # --- main job -------------------------------------------------------------
     def run(self, dry_run: bool | None = None, reason: str = "manual") -> RunResult:

@@ -58,6 +58,13 @@ DEFAULT_SETTINGS = {
     "delay_min_sec": 20,
     "delay_max_sec": 60,
     "max_per_run": 25,
+    # Auto-poker
+    "poke_enabled": False,
+    "poke_interval_minutes": 10,
+    "poke_mode": "everyone",        # "everyone" (except ignored) or "selected" (only people set to Auto)
+    "poke_rules": {},               # {profile URL or lowercase name: "auto" | "ignore"}
+    "poke_headless": True,          # run poke checks without a visible browser window
+    "poke_max_per_check": 20,
     # Browser
     "headless": False,
     "browser_channel": "chromium",  # "chromium", "chrome" or "msedge"
@@ -124,7 +131,8 @@ class State(JsonStore):
 
     def __init__(self, path: Path | None = None):
         super().__init__(path or (data_dir() / "state.json"),
-                         {"slots": {}, "sent": {}, "fails": {}, "last_run": None, "last_result": ""})
+                         {"slots": {}, "sent": {}, "fails": {}, "last_run": None, "last_result": "",
+                          "pokers": {}, "last_poke_check": None, "last_poke_result": ""})
         self.prune()
 
     # --- slots -----------------------------------------------------------
@@ -171,6 +179,37 @@ class State(JsonStore):
         with self.lock:
             self.data["last_run"] = datetime.now().isoformat(timespec="seconds")
             self.data["last_result"] = result
+            self.save()
+
+    # --- pokes ---------------------------------------------------------------
+    def upsert_poker(self, key: str, name: str, url: str, text: str = "") -> None:
+        with self.lock:
+            p = self.data["pokers"].setdefault(key, {"name": name, "url": url, "poked_back": 0})
+            p.update(name=name or p.get("name", ""), url=url or p.get("url", ""),
+                     last_seen=datetime.now().isoformat(timespec="seconds"), last_text=text[:200])
+            self.save()
+
+    def record_poke_back(self, key: str) -> None:
+        with self.lock:
+            p = self.data["pokers"].get(key)
+            if p is not None:
+                p["poked_back"] = p.get("poked_back", 0) + 1
+                p["last_poked_back"] = datetime.now().isoformat(timespec="seconds")
+                self.save()
+
+    def pokers(self) -> dict:
+        with self.lock:
+            return copy.deepcopy(self.data["pokers"])
+
+    def forget_poker(self, key: str) -> None:
+        with self.lock:
+            if self.data["pokers"].pop(key, None) is not None:
+                self.save()
+
+    def set_last_poke(self, result: str) -> None:
+        with self.lock:
+            self.data["last_poke_check"] = datetime.now().isoformat(timespec="seconds")
+            self.data["last_poke_result"] = result
             self.save()
 
     def prune(self) -> None:

@@ -10,6 +10,7 @@ missed slots never carry over past midnight.
 from __future__ import annotations
 
 import logging
+import random
 import re
 import threading
 from datetime import datetime, timedelta
@@ -150,3 +151,68 @@ class Scheduler:
                 self.retry_at = datetime.now() + timedelta(minutes=int(cfg.get("retry_minutes", 20)))
                 log.info("Will retry at %s.", self.retry_at.strftime("%H:%M"))
         self.on_event("schedule", None)
+
+
+class PokeScheduler:
+    """Checks the pokes page every N minutes (with a little randomness) while enabled."""
+
+    TICK_SECONDS = 10
+    JITTER = 0.2
+
+    def __init__(self, settings, runner, on_event=None):
+        self.settings = settings
+        self.runner = runner
+        self.on_event = on_event or (lambda *a: None)
+        self.next_at: datetime | None = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, name="poke-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def poke(self):
+        self._wake.set()
+
+    def interval(self) -> timedelta:
+        minutes = max(2, int(self.settings.get("poke_interval_minutes") or 10))
+        return timedelta(minutes=minutes * random.uniform(1 - self.JITTER, 1 + self.JITTER))
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.tick(datetime.now())
+            except Exception:
+                log.exception("Poke scheduler error")
+            self._wake.wait(self.TICK_SECONDS)
+            self._wake.clear()
+
+    def tick(self, now: datetime):
+        if not self.settings.get("poke_enabled"):
+            self.next_at = None
+            return
+        if self.next_at is None:
+            self.next_at = now + timedelta(seconds=15)  # first check shortly after enabling/starting
+            self.on_event("poke_schedule", None)
+            return
+        cap = now + timedelta(minutes=max(2, int(self.settings.get("poke_interval_minutes") or 10)) * 1.25)
+        if self.next_at > cap:
+            self.next_at = now + self.interval()  # interval was shortened
+        if now < self.next_at:
+            return
+        if self.runner.busy:
+            self.next_at = now + timedelta(seconds=60)  # a birthday run is going; try again shortly
+            return
+        result = self.runner.poke(reason="auto")
+        if result.busy:
+            self.next_at = datetime.now() + timedelta(seconds=60)
+        else:
+            self.next_at = datetime.now() + self.interval()
+        self.on_event("poke_schedule", None)

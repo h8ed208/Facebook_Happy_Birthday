@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+*.egg-info/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Never commit personal data if someone runs the app from inside the repo
+browser_profile/
+debug/
+settings.json
+state.json
+bot.log*

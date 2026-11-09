@@ -1,4 +1,4 @@
-# FB Birthday Bot 🎂
+# FB Birthday Bot 🎂👉
 
 Never miss a friend's birthday on Facebook again. This desktop app checks your
 Facebook birthdays page on a schedule and sends each friend a message you write
@@ -27,6 +27,9 @@ as the app is running again that day.
   extra check times skip them.
 - **Exact messages:** the bot clears any greeting Facebook pre-fills, and it
   checks the text in the box before pressing Enter.
+- **Auto-poker for poke wars:** pokes people back automatically every few minutes.
+  You choose who: everyone except people you ignore, or only people you pick.
+  Ignored people are never poked back, so their poke stays where it is.
 - **Starts with your computer** (Windows, macOS, Linux) and can run minimized.
 - **Safe login:** you log in yourself in a real browser window, 2-factor included.
   Your password is never stored. The app keeps a browser session in its own
@@ -41,8 +44,8 @@ as the app is running again that day.
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/fb-birthday-bot.git
-cd fb-birthday-bot
+git clone https://github.com/h8ed208/Facebook_Happy_Birthday.git
+cd Facebook_Happy_Birthday
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
@@ -71,6 +74,32 @@ commands above.
    and messages.
 5. Happy with it? Untick **Settings → Preview mode**. Runs now send for real.
 
+## Auto-poker
+
+Open the **Pokes** tab:
+
+1. Click **🔍 Scan pokes (don't poke)**. Everyone currently waiting for a poke
+   back appears in the list, and nobody gets poked.
+2. Pick a mode:
+   - **Poke back everyone, except people set to Ignore**, or
+   - **Only poke back people I set to Auto-poke back**.
+3. Select people in the list and click **Auto-poke back**, **Ignore** or
+   **Default** (Default follows the mode). The *What happens* column shows the
+   result for each person. You can also add someone by name or profile link
+   before they show up.
+4. Tick **Automatically poke people back** and set how often to check
+   (10 minutes by default, randomised a little each time).
+
+Some details:
+
+- The bot only ever clicks **Poke back**. It never starts a poke with anyone,
+  and it ignores the *Suggested pokes* section.
+- If it can't tell who a poke is from, it leaves that poke alone.
+- If Facebook says you're poking too much, the bot stops for that check and
+  tries again at the next one.
+- Poke checks run hidden by default, so a browser window doesn't pop up every
+  few minutes. They wait their turn if a birthday check is running.
+
 ## How scheduling and catch-up work
 
 - Each check time is a slot for the day. When a slot runs successfully, it's
@@ -93,6 +122,7 @@ need a tweak.
 | Problem | Fix |
 |---|---|
 | "Couldn't recognise the birthdays page layout" | Your Facebook may not be in English, or the layout changed. Open **Settings → Edit selectors.json** and adjust `today_heading_regex` (for example, the heading text in your language). |
+| Pokes aren't found | Facebook may label the button differently. Open **Settings → Edit selectors.json** and adjust `poke_back_regex` (the button text, e.g. in your language). |
 | Messenger asks for a PIN | Click **Log in to Facebook**, open Messenger in that window, enter your chat PIN once, and close it. |
 | Logged out / security checks | Turn off **Run hidden** and log in again. |
 | Something else | **Settings → Save birthdays-page snapshot** saves a screenshot and the page HTML to the `debug` folder. Failed sends save one automatically too. `bot.log` has the full history. |
@@ -115,8 +145,8 @@ Use **Settings → Log out (forget session)** to delete the saved Facebook sessi
 fb_birthday_bot.py        entry point
 birthday_bot/
   app.py                  tkinter GUI
-  scheduler.py            daily slots, catch-up, retries
-  runner.py               the check job: find birthdays, pick messages, send, log
+  scheduler.py            daily birthday slots (catch-up, retries) and the poke-check timer
+  runner.py               the jobs: birthday check (find, pick message, send, log) and poke check
   fb_client.py            Playwright browser automation (all Facebook-specific code)
   settings.py             JSON settings/state in the per-user data folder
   autostart.py            start-on-login for Windows / macOS / Linux

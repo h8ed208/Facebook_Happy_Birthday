@@ -73,3 +73,34 @@ def test_new_day_runs_again(tmp_path):
     sc.tick(DAY.replace(hour=10))
     sc.tick(datetime(2026, 11, 7, 10))
     assert len(r.calls) == 2
+
+
+class FakePokeRunner:
+    busy = False
+
+    def __init__(self):
+        self.calls = 0
+
+    def poke(self, reason="", scan_only=False):
+        from birthday_bot.runner import PokeResult
+        self.calls += 1
+        return PokeResult(ok=True)
+
+
+def test_poke_scheduler_runs_on_interval_only_when_enabled(tmp_path):
+    from datetime import timedelta
+    from birthday_bot.scheduler import PokeScheduler
+    s = Settings(tmp_path / "settings.json")
+    r = FakePokeRunner()
+    ps = PokeScheduler(s, r)
+    ps.tick(DAY)
+    assert ps.next_at is None and r.calls == 0          # off by default
+    s.set("poke_enabled", True)
+    ps.tick(DAY)                                         # schedules the first check
+    ps.tick(DAY + timedelta(seconds=20))
+    assert r.calls == 1
+    nxt = ps.next_at
+    assert ps.next_at is not None
+    s.set("poke_enabled", False)
+    ps.tick(nxt + timedelta(minutes=1))
+    assert r.calls == 1 and ps.next_at is None

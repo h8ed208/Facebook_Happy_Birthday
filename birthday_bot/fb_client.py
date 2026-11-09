@@ -34,6 +34,10 @@ DEFAULT_SELECTORS = {
     "close_chat": "[aria-label='Close chat']",
     # Write-on-timeline box inside a birthday card
     "timeline_textbox": "div[role='textbox'][contenteditable='true']",
+    # Pokes page
+    "pokes_url": "https://www.facebook.com/pokes/",
+    "poke_back_regex": r"^poke back$",
+    "poke_limit_regex": r"(can['’]?t|cannot) poke|try again later|slow down|temporarily (blocked|restricted)",
     # Text that means Messenger wants an end-to-end-encryption PIN
     "pin_prompt_regex": r"enter your pin|restore (your )?chat history|create a pin",
 }
@@ -63,6 +67,10 @@ class SendError(FBError):
 
 
 class PlaywrightMissing(FBError):
+    pass
+
+
+class PokeLimit(FBError):
     pass
 
 
@@ -160,6 +168,43 @@ _EXTRACT_JS = r"""
   return { found: true, otherExists, anchors };
 }
 """
+
+
+# Finds every "Poke back" button and the card it belongs to. Each button is tagged with
+# data-bb-poke=<n> so Python can click it. The card is the closest ancestor that holds a
+# named link and no other "Poke back" button, so a card can't borrow a neighbour's name.
+_POKES_JS = r"""
+(args) => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const re = new RegExp(args.btn, 'i');
+  const root = document.querySelector('[role="main"]') || document.body;
+  const label = el => norm(el.getAttribute('aria-label') || el.innerText);
+  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  let btns = Array.from(root.querySelectorAll('[role="button"],button')).filter(b => re.test(label(b)) && visible(b));
+  btns = btns.filter(b => !btns.some(o => o !== b && b.contains(o)));
+  document.querySelectorAll('[data-bb-poke]').forEach(el => el.removeAttribute('data-bb-poke'));
+  const named = el => Array.from(el.querySelectorAll('a[href]')).some(a => norm(a.innerText) && !/\/pokes/.test(a.href));
+  return btns.map((b, i) => {
+    b.setAttribute('data-bb-poke', String(i));
+    let card = b;
+    while (!named(card) && card.parentElement && card.parentElement !== root) {
+      const p = card.parentElement;
+      if (btns.filter(x => p.contains(x)).length > 1) break;
+      card = p;
+    }
+    const anchors = named(card) ? Array.from(card.querySelectorAll('a[href]'))
+      .map(a => ({ href: a.href, text: norm(a.innerText || a.getAttribute('aria-label') || '') })) : [];
+    return { index: i, anchors, text: norm(card.innerText).slice(0, 300) };
+  });
+}
+"""
+
+
+@dataclass
+class PokeEntry:
+    index: int
+    friend: "Friend | None"
+    text: str
 
 
 def friends_from_anchors(anchors: list[dict], own_id: str | None = None) -> list[Friend]:
@@ -345,6 +390,42 @@ class FacebookClient:
                           f"A screenshot was saved{' to ' + str(shot) if shot else ''}. "
                           "If your Facebook isn't in English, edit selectors.json.")
         return friends_from_anchors(result["anchors"], self._own_id())
+
+    # --- pokes -------------------------------------------------------------
+    def pokes(self) -> list[PokeEntry]:
+        """Everyone currently showing a "Poke back" button. Doesn't poke anyone."""
+        if not self.page.url.rstrip("/").endswith("/pokes"):
+            self._goto(self.sel["pokes_url"])
+        raw = self.page.evaluate(_POKES_JS, {"btn": self.sel["poke_back_regex"]})
+        own = self._own_id()
+        entries = []
+        for r in raw:
+            found = friends_from_anchors(r["anchors"], own)
+            entries.append(PokeEntry(index=r["index"], friend=found[0] if found else None, text=r["text"]))
+        return entries
+
+    def poke_back(self, entry: PokeEntry):
+        btn = self.page.locator(f'[data-bb-poke="{entry.index}"]')
+        if not btn.count():
+            raise SendError("The Poke back button disappeared before it could be clicked.")
+        btn.first.click()
+        self._pause(1.5, 3.0)
+        try:
+            body = self.page.inner_text("body", timeout=3_000)
+        except Exception:
+            body = ""
+        if re.search(self.sel["poke_limit_regex"], body, re.I):
+            raise PokeLimit("Facebook says you can't poke right now (rate limit). Pausing pokes for this check.")
+        still = self.page.locator(f'[data-bb-poke="{entry.index}"]')
+        try:
+            if still.count() and still.first.is_visible():
+                label = (still.first.get_attribute("aria-label") or still.first.inner_text()).strip()
+                if re.search(self.sel["poke_back_regex"], label, re.I):
+                    raise SendError("The Poke back button is still there; the poke may not have gone through.")
+        except SendError:
+            raise
+        except Exception:
+            pass
 
     # --- sending ---------------------------------------------------------
     def send(self, friend: Friend, text: str, mode: str = "messenger", fallback: bool = True) -> str:

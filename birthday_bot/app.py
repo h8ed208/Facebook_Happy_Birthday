@@ -19,8 +19,8 @@ from tkinter.scrolledtext import ScrolledText
 from . import autostart
 from . import settings as S
 from .fb_client import Friend
-from .runner import BirthdayRunner, render_message
-from .scheduler import Scheduler, normalize_time, parse_times
+from .runner import BirthdayRunner, poke_rule_key, render_message
+from .scheduler import PokeScheduler, Scheduler, normalize_time, parse_times
 
 log = logging.getLogger("birthday_bot")
 SINGLE_INSTANCE_PORT = 47613
@@ -102,6 +102,7 @@ class App:
         self._setup_logging()
         self.runner = BirthdayRunner(self.settings, self.state, on_event=self.emit)
         self.scheduler = Scheduler(self.settings, self.state, self.runner, on_event=self.emit)
+        self.poke_scheduler = PokeScheduler(self.settings, self.runner, on_event=self.emit)
 
         root.title("Facebook Birthday Bot")
         root.geometry("860x640")
@@ -114,6 +115,7 @@ class App:
             threading.Thread(target=self._listen, args=(server,), daemon=True).start()
 
         self.scheduler.start()
+        self.poke_scheduler.start()
         self._bg(self.runner.check_login)
         root.after(150, self._pump)
         root.after(500, self._tick_status)
@@ -170,6 +172,8 @@ class App:
                         self.preview_btn.state(["!disabled"])
                     self._refresh_today()
                     self._refresh_status()
+                elif kind in ("poke_done", "poke_schedule"):
+                    self._refresh_pokes()
                 elif kind == "show":
                     self.root.deiconify()
                     self.root.lift()
@@ -201,6 +205,7 @@ class App:
             if on_change:
                 on_change(val)
             self.scheduler.poke()
+            self.poke_scheduler.poke()
             self.root.after(300, self._refresh_status)
 
         var.trace_add("write", cb)
@@ -213,6 +218,7 @@ class App:
         self._build_dashboard(ttk.Frame(nb, padding=10), nb)
         self._build_messages(ttk.Frame(nb, padding=10), nb)
         self._build_schedule(ttk.Frame(nb, padding=10), nb)
+        self._build_pokes(ttk.Frame(nb, padding=10), nb)
         self._build_settings(ttk.Frame(nb, padding=10), nb)
 
     def _build_dashboard(self, f, nb):
@@ -446,6 +452,169 @@ class App:
 
         ttk.Button(f, text="Quit app", command=self.quit).pack(anchor="e", pady=10)
 
+    # --- pokes tab --------------------------------------------------------
+    POKE_RULE_LABELS = {"auto": "👉 Auto-poke back", "ignore": "🚫 Ignore (never poke)", None: "Default"}
+
+    def _build_pokes(self, f, nb):
+        nb.add(f, text="  Pokes  ")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        en = tk.BooleanVar()
+        self.bind_var(en, "poke_enabled", on_change=lambda v: log.info("Auto-poker %s.", "on" if v else "off"))
+        ttk.Checkbutton(top, variable=en, text="Automatically poke people back").pack(side="left")
+        ttk.Label(top, text="   Check every").pack(side="left")
+        iv = tk.IntVar()
+        self.bind_var(iv, "poke_interval_minutes", int)
+        ttk.Spinbox(top, from_=2, to=240, width=5, textvariable=iv).pack(side="left", padx=4)
+        ttk.Label(top, text="minutes").pack(side="left")
+
+        mf = ttk.Frame(f)
+        mf.pack(fill="x", pady=(6, 0))
+        mode = tk.StringVar()
+        self.bind_var(mode, "poke_mode", on_change=lambda v: self._refresh_pokes())
+        ttk.Radiobutton(mf, text="Poke back everyone, except people set to Ignore", value="everyone",
+                        variable=mode).pack(anchor="w")
+        ttk.Radiobutton(mf, text="Only poke back people I set to Auto-poke back", value="selected",
+                        variable=mode).pack(anchor="w")
+        hd = tk.BooleanVar()
+        self.bind_var(hd, "poke_headless")
+        ttk.Checkbutton(mf, variable=hd, text="Run poke checks hidden (no browser window popping up)").pack(anchor="w")
+
+        st = ttk.Frame(f)
+        st.pack(fill="x", pady=8)
+        ttk.Button(st, text="🔍 Scan pokes (don't poke)",
+                   command=lambda: self._poke_now(scan_only=True)).pack(side="left")
+        ttk.Button(st, text="👉 Poke back now", command=lambda: self._poke_now(scan_only=False)).pack(side="left", padx=6)
+        self.poke_status_var = tk.StringVar()
+        ttk.Label(st, textvariable=self.poke_status_var, wraplength=480).pack(side="left", padx=8)
+
+        pf = ttk.LabelFrame(f, text="People who've poked you (Scan pokes to fill this list)", padding=6)
+        pf.pack(fill="both", expand=True)
+        cols = ("name", "rule", "result", "last", "count")
+        self.poke_tree = ttk.Treeview(pf, columns=cols, show="headings", height=8, selectmode="extended")
+        for c, w, label in (("name", 180, "Person"), ("rule", 170, "Setting"), ("result", 150, "What happens"),
+                            ("last", 120, "Last seen poking"), ("count", 90, "Poked back")):
+            self.poke_tree.heading(c, text=label)
+            self.poke_tree.column(c, width=w, anchor="w", stretch=(c == "name"))
+        self.poke_tree.pack(side="left", fill="both", expand=True)
+        b = ttk.Frame(pf)
+        b.pack(side="left", fill="y", padx=(6, 0))
+        ttk.Button(b, text="Auto-poke back", command=lambda: self._set_poke_rule("auto")).pack(fill="x")
+        ttk.Button(b, text="Ignore", command=lambda: self._set_poke_rule("ignore")).pack(fill="x", pady=4)
+        ttk.Button(b, text="Default", command=lambda: self._set_poke_rule(None)).pack(fill="x")
+        ttk.Button(b, text="Remove from list", command=self._forget_pokers).pack(fill="x", pady=(16, 0))
+
+        af = ttk.Frame(f)
+        af.pack(fill="x", pady=(6, 0))
+        ttk.Label(af, text="Add someone by name or profile link:").pack(side="left")
+        self.poke_add_entry = ttk.Entry(af, width=40)
+        self.poke_add_entry.pack(side="left", padx=6)
+        ttk.Button(af, text="Ignore", command=lambda: self._add_poke_rule("ignore")).pack(side="left")
+        ttk.Button(af, text="Auto-poke back", command=lambda: self._add_poke_rule("auto")).pack(side="left", padx=4)
+        ttk.Label(f, foreground="#555", wraplength=780, text="Ignored people are never poked back, so their poke "
+                  "stays where it is. Only “Poke back” buttons are ever clicked – the bot never starts a poke "
+                  "with anyone.").pack(anchor="w", pady=(6, 0))
+        self._refresh_pokes()
+
+    def _rule_for(self, rules, key, name):
+        return rules.get(key) or rules.get((name or "").lower())
+
+    def _refresh_pokes(self):
+        if not hasattr(self, "poke_tree"):
+            return
+        rules = self.settings.get("poke_rules") or {}
+        everyone = self.settings.get("poke_mode") == "everyone"
+        sel = set(self.poke_tree.selection())
+        self.poke_tree.delete(*self.poke_tree.get_children())
+        rows = []
+        for key, p in self.state.pokers().items():
+            rows.append((key, p.get("name", key), self._rule_for(rules, key, p.get("name")), p.get("last_seen"),
+                         p.get("poked_back", 0)))
+        known = {r[0] for r in rows} | {r[1].lower() for r in rows}
+        for key, rule in rules.items():  # people added by hand who haven't shown up yet
+            if key not in known:
+                rows.append((key, key, rule, None, 0))
+        for key, name, rule, last, count in sorted(rows, key=lambda r: r[1].lower()):
+            if rule == "ignore":
+                result = "Never poked"
+            elif rule == "auto" or everyone:
+                result = "Poked back"
+            else:
+                result = "Left alone"
+            last_txt = datetime.fromisoformat(last).strftime("%b %d %H:%M") if last else "—"
+            self.poke_tree.insert("", "end", iid=key, values=(name, self.POKE_RULE_LABELS.get(rule, rule),
+                                                             result, last_txt, count))
+        for iid in sel:
+            if self.poke_tree.exists(iid):
+                self.poke_tree.selection_add(iid)
+        self._refresh_poke_status()
+
+    def _refresh_poke_status(self):
+        if not hasattr(self, "poke_status_var"):
+            return
+        parts = []
+        if not self.settings.get("poke_enabled"):
+            parts.append("Auto-poker is off.")
+        elif self.poke_scheduler.next_at:
+            parts.append(f"Next check {self.poke_scheduler.next_at:%H:%M}.")
+        else:
+            parts.append("First check starting…")
+        last = self.state.data.get("last_poke_check")
+        if last:
+            parts.append(f"Last check {datetime.fromisoformat(last):%H:%M}: {self.state.data.get('last_poke_result', '')}")
+        self.poke_status_var.set("  ".join(parts))
+
+    def _set_poke_rule(self, rule):
+        keys = self.poke_tree.selection()
+        if not keys:
+            messagebox.showinfo("Pokes", "Select one or more people in the list first.")
+            return
+        rules = self.settings.get("poke_rules") or {}
+        pokers = self.state.pokers()
+        for key in keys:
+            name = (pokers.get(key) or {}).get("name", "")
+            rules.pop(name.lower(), None)  # one rule per person, stored by profile link
+            if rule is None:
+                rules.pop(key, None)
+            else:
+                rules[key] = rule
+        self.settings.set("poke_rules", rules)
+        self._refresh_pokes()
+
+    def _add_poke_rule(self, rule):
+        text = self.poke_add_entry.get().strip()
+        if not text:
+            return
+        rules = self.settings.get("poke_rules") or {}
+        rules[poke_rule_key(text)] = rule
+        self.settings.set("poke_rules", rules)
+        self.poke_add_entry.delete(0, "end")
+        self._refresh_pokes()
+
+    def _forget_pokers(self):
+        keys = self.poke_tree.selection()
+        if not keys:
+            return
+        pokers = self.state.pokers()
+        if any((self.settings.get("poke_rules") or {}).get(k) == "ignore" for k in keys):
+            if not messagebox.askyesno("Remove", "Removing someone also removes their Ignore setting, so they "
+                                       "could be poked back. Remove anyway?"):
+                return
+        rules = self.settings.get("poke_rules") or {}
+        for key in keys:
+            self.state.forget_poker(key)
+            rules.pop(key, None)
+            rules.pop((pokers.get(key) or {}).get("name", "").lower(), None)
+        self.settings.set("poke_rules", rules)
+        self._refresh_pokes()
+
+    def _poke_now(self, scan_only):
+        if self.runner.busy:
+            messagebox.showinfo("Busy", "Another task is running – try again in a moment.")
+            return
+        self.poke_status_var.set("Scanning…" if scan_only else "Checking pokes…")
+        self._bg(self.runner.poke, scan_only, "manual")
+
     # --- status ----------------------------------------------------------
     def _refresh_status(self):
         self.login_var.set({True: "✔ Logged in", False: "✘ Not logged in", None: "Checking…",
@@ -471,6 +640,7 @@ class App:
 
     def _tick_status(self):
         self._refresh_status()
+        self._refresh_poke_status()
         self.root.after(30_000, self._tick_status)
 
     def _refresh_today(self):
@@ -639,6 +809,7 @@ class App:
             return
         self.runner.stop_event.set()
         self.scheduler.stop()
+        self.poke_scheduler.stop()
         self.root.destroy()
 
 
